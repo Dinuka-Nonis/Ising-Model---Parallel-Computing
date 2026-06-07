@@ -8,11 +8,6 @@
 #define STEPS 1000
 #define T     2.269f
 
-/*
- * fast GPU-side RNG using xorshift32
- * rand() cant be used in device code so we need something else
- * xorshift is simple and good enough for monte carlo
- */
 __device__ __inline__
 uint32_t xorshift32(uint32_t *state) {
     uint32_t x = *state;
@@ -47,15 +42,7 @@ __global__ void init_rng_kernel(uint32_t *states, uint32_t base_seed) {
     states[idx] = (s == 0u) ? 1u : s;
 }
 
-/*
- * metropolis kernel - launches N/2 x N threads, one per color cell
- * splitting the grid in half (color=0 or color=1) means no two threads
- * in the same launch write the same cell, so no race conditions
- *
- * spins stored as int8_t to fit 4x more data in cache compared to int32
- * __ldg() loads neighbors through the read-only cache which helps
- * with the stride-2 access pattern
- */
+
 __global__ void metropolis_kernel(int8_t *grid, uint32_t *states,
                                    int color, float inv_T) {
     int tx = blockIdx.x * blockDim.x + threadIdx.x;  /* half-column index */
@@ -82,12 +69,7 @@ __global__ void metropolis_kernel(int8_t *grid, uint32_t *states,
     int nb = top + bottom + left + right;
     int dE = 2 * spin * nb;
 
-    /*
-     * metropolis acceptance rule:
-     * always flip if energy goes down, otherwise flip with prob exp(-dE/T)
-     * gpu expf() is a single hardware instruction so no lookup table needed
-     * (unlike the cpu versions where exp() was expensive)
-     */
+
     if (dE <= 0) {
         grid[sidx] = (int8_t)(-spin);
     } else {
@@ -124,9 +106,14 @@ int main(int argc, char *argv[]) {
     size_t state_bytes = (N/2) * N * sizeof(uint32_t);
 
     int8_t *h_grid = (int8_t *)malloc(grid_bytes);
-    srand(42);
+    /*
+     * use rand_r(seed=42) to match the serial/openmp/mpi initial grid exactly.
+     * the global rand() call that was here before produced a different sequence,
+     * making the initial magnetization printed here inconsistent with the other runs.
+     */
+    unsigned int init_seed = 42u;
     for (int i = 0; i < N * N; i++)
-        h_grid[i] = (int8_t)((rand() % 2) * 2 - 1);
+        h_grid[i] = (int8_t)((rand_r(&init_seed) % 2) * 2 - 1);
 
     printf("Initial magnetization: %.4f\n", compute_magnetization(h_grid));
 
@@ -146,8 +133,23 @@ int main(int argc, char *argv[]) {
     dim3 blocks((N/2 + BLOCK_SIZE - 1) / BLOCK_SIZE,
                 (N   + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    /* initialize rng states before timing starts */
-    init_rng_kernel<<<blocks, threads>>>(d_states, 0xDEADBEEFu);
+    /*
+     * initialise rng states before timing starts.
+     *
+     * the seed 0xDEADBEEF is a fixed constant intentionally.  this means
+     * every run of this program, regardless of block size, starts from
+     * the same physical state and produces the same final magnetization.
+     * the point of varying block size is to measure TIMING differences
+     * (occupancy, warp efficiency, SM utilisation), not physics differences.
+     * identical magnetization across block sizes therefore confirms that
+     * the simulation is deterministic and block size is purely a performance
+     * tuning parameter with no effect on correctness.
+     *
+     * if you want each run to start from a different random state, replace
+     * the constant with (uint32_t)time(NULL).
+     */
+    const uint32_t RNG_SEED = 0xDEADBEEFu;
+    init_rng_kernel<<<blocks, threads>>>(d_states, RNG_SEED);
     cudaDeviceSynchronize();
 
     /* use cuda events for accurate gpu timing */
