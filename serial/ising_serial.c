@@ -18,12 +18,26 @@
  */
 static int8_t grid[N+2][N];
 
+/*
+ * Per-site RNG states: rng[i][j] holds the xorshift32 state for site (i,j).
+ * Seeded once from site coordinates so every implementation uses the same
+ * random sequence for every site, regardless of thread/process count.
+ * Index convention matches the grid: rows 1..N are real sites.
+ */
+static uint32_t rng[N+2][N];
+
 static double e4, e8;
 
-/*
- * xorshift32: 3 XOR-shifts, no division, no memory beyond one uint32.
- * ~4 cycles vs rand_r's ~15-20.  Fine for Metropolis MC.
- */
+/* Wang hash: mixes bits well; used to derive a non-zero seed from coordinates */
+static inline uint32_t wang_hash(uint32_t x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x ^= x >> 4;
+    x *= 0x27d4eb2du;
+    x ^= x >> 15;
+    return x ? x : 1u;   /* xorshift32 must never start at 0 */
+}
+
 static inline uint32_t xorshift32(uint32_t *s) {
     uint32_t x = *s;
     x ^= x << 13;
@@ -31,14 +45,16 @@ static inline uint32_t xorshift32(uint32_t *s) {
     x ^= x << 5;
     return *s = x;
 }
-/* multiply by 2^-32 instead of dividing by RAND_MAX - one FMUL, no FDIV */
 #define RAND01(s) (xorshift32(s) * 2.3283064365386963e-10)
 
 static void initialize(void) {
     unsigned int seed = 42;
     for (int i = 1; i <= N; i++)
-        for (int j = 0; j < N; j++)
+        for (int j = 0; j < N; j++) {
             grid[i][j] = (int8_t)((rand_r(&seed) % 2) * 2 - 1);
+            /* seed per-site RNG from global row index (i-1) and column j */
+            rng[i][j] = wang_hash((uint32_t)((i-1) * N + j) ^ 0xABCD1234u);
+        }
 }
 
 static double magnetization(void) {
@@ -50,30 +66,25 @@ static double magnetization(void) {
 }
 
 static inline void sync_ghosts(void) {
-    memcpy(grid[0],   grid[N], N);   /* ghost below = last real row  */
-    memcpy(grid[N+1], grid[1], N);   /* ghost above = first real row */
+    memcpy(grid[0],   grid[N], N);
+    memcpy(grid[N+1], grid[1], N);
 }
 
 static void metropolis_serial(void) {
-    uint32_t seed = 1234567891u;
-
     for (int sweep = 0; sweep < STEPS; sweep++) {
         for (int color = 0; color < 2; color++) {
 
-            sync_ghosts();  /* 2x 256-byte memcpy - negligible */
+            sync_ghosts();
 
             for (int i = 1; i <= N; i++) {
-                const int8_t *up  = grid[i+1];  /* no % - ghost handles it */
+                const int8_t *up  = grid[i+1];
                 const int8_t *dn  = grid[i-1];
                 int8_t       *cur = grid[i];
+                uint32_t     *rng_row = rng[i];
 
                 int j_start = (((i-1) & 1) == color) ? 0 : 1;
 
                 for (int j = j_start; j < N; j += 2) {
-                    /*
-                     * Horizontal wrap: only two sites per row touch the edge.
-                     * Use branchless ternary (cmov) instead of %.
-                     */
                     int jp1 = (j == N-1) ? 0   : j+1;
                     int jm1 = (j == 0)   ? N-1 : j-1;
 
@@ -84,8 +95,7 @@ static void metropolis_serial(void) {
                     if (dE <= 0) {
                         cur[j] = (int8_t)-spin;
                     } else {
-                        /* branch-free boltzmann lookup */
-                        if (RAND01(&seed) < ((dE == 4) ? e4 : e8))
+                        if (RAND01(&rng_row[j]) < ((dE == 4) ? e4 : e8))
                             cur[j] = (int8_t)-spin;
                     }
                 }
